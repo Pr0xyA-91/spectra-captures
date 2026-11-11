@@ -1,0 +1,20 @@
+{
+  "catalog_version": "1.0",
+  "total_captures": 1,
+  "captures": [
+    {
+      "file": "captures/Jura/ENA_7/spectra_capture_13500_20261111_101852.json",
+      "model_name": "13500",
+      "article_number": "13500",
+      "serial_number": "20110414017075",
+      "production_date": "14.4.2011",
+      "firmware": "EF634 V01.31",
+      "bootloader": "LOADER V5.0",
+      "ic_code": "DF01",
+      "words_count": 512,
+      "timestamp": "2026-11-11T10:18:52.976230",
+      "probe_version": "1.1.0",
+      "has_ground_truth": true
+    }
+  ]
+}
