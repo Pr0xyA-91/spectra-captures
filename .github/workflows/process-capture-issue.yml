@@ -1,0 +1,113 @@
+name: Auto-Process Capture Issue
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  process-capture:
+    if: contains(github.event.issue.labels.*.name, 'capture') || startsWith(github.event.issue.title, '[Capture]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract and Ingest Capture Payload
+        id: ingest
+        run: |
+          python3 -c "
+          import os, re, json, sys
+
+          issue_body = os.environ.get('ISSUE_BODY', '')
+          issue_num = os.environ.get('ISSUE_NUMBER', '')
+
+          # Find json block inside markdown fences
+          match = re.search(r'\`\`\`(?:json)?\s*(\{.*?\})\s*\`\`\`', issue_body, re.DOTALL)
+          if not match:
+              print('[-] Error: No JSON code block found in issue body.')
+              sys.exit(1)
+
+          raw_json = match.group(1).strip()
+          try:
+              data = json.loads(raw_json)
+          except Exception as e:
+              print(f'[-] Invalid JSON payload: {e}')
+              sys.exit(1)
+
+          ident = data.get('identity', {})
+          mfg = ident.get('manufacturer', 'Jura').strip() or 'Jura'
+          model = ident.get('model_name', 'Unknown').strip() or 'Unknown'
+          article = str(ident.get('article_number', '')).strip() or 'unknown'
+          clean_model = re.sub(r'[^A-Za-z0-9_]', '_', model).strip('_')
+
+          ts = data.get('metadata', {}).get('timestamp', '')
+          clean_ts = re.sub(r'[^0-9]', '', ts)[:14] or 'unknown'
+
+          out_dir = os.path.join('captures', mfg, clean_model)
+          os.makedirs(out_dir, exist_ok=True)
+
+          filename = f'spectra_capture_{article}_{clean_ts}.json'
+          dest_path = os.path.join(out_dir, filename)
+
+          with open(dest_path, 'w', encoding='utf-8') as f:
+              json.dump(data, f, indent=2)
+
+          print(f'[+] Successfully ingested capture to: {dest_path}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+              gh_out.write(f'dest_path={dest_path}\n')
+              gh_out.write(f'model_name={model}\n')
+              gh_out.write(f'article={article}\n')
+          "
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+
+      - name: Re-index Captures Catalog
+        run: |
+          python3 scripts/index_captures.py
+
+      - name: Commit & Push New Capture
+        run: |
+          git config user.name "spectra-telemetry-bot[bot]"
+          git config user.email "bot@spectra.local"
+          git add captures/ INDEX.json README.md
+          if git status --porcelain | grep -q .; then
+            git commit -m "feat(telemetry): integrate ${{ steps.ingest.outputs.model_name }} capture [skip ci]"
+            git push
+          fi
+
+      - name: Close Issue with Confirmation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const model = "${{ steps.ingest.outputs.model_name }}";
+            const file = "${{ steps.ingest.outputs.dest_path }}";
+            const comment = `### ✅ Telemetry Capture Ingested Successfully!\n\n` +
+              `Thank you for contributing to the SPECTRA community telemetry database!\n\n` +
+              `- **Target Model**: \`${model}\`\n` +
+              `- **Cataloged File**: \`${file}\`\n` +
+              `- **Database Index**: Updated in [\`INDEX.json\`](https://github.com/Pr0xyA-91/spectra-captures/blob/main/INDEX.json)\n\n` +
+              `Engineering will review this capture to calibrate beverage and maintenance register offsets for upcoming SPECTRA releases.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed'
+            });
