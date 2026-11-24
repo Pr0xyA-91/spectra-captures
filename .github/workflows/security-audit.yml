@@ -1,0 +1,73 @@
+name: Daily Security Audit (ClamAV + Payload Audit + CodeQL)
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  clamav-and-payload-audit:
+    name: ClamAV Antivirus & Strict Payload Poisoning / Secret Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ClamAV & Update Virus Definitions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav clamav-freshclam
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          sudo freshclam --stdout || true
+
+      - name: Run ClamAV Recursive Scan
+        run: |
+          clamscan -r --infected --no-summary --exclude-dir='^\./\.git' .
+
+      - name: Run Strict Payload Poisoning, Secret, Size & Hex-EEPROM Audit
+        run: |
+          python3 scripts/validate_payload.py --scan-repo --strict
+          python3 scripts/index_captures.py --check
+
+      - name: Run Security Validator Unit Tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+  codeql-analysis:
+    name: CodeQL Static Security Analysis (Python)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"

@@ -1,20 +1,22 @@
-name: Auto-Process Capture Issue
+name: Auto-Process Capture Issue (Hardened Option A)
 
 on:
   issues:
     types: [opened, labeled]
 
+# Default read-only; only the second job receives contents: write after strict Option A approval
 permissions:
-  contents: write
+  contents: read
   issues: write
 
-# Serialize runs writing to main so simultaneous opened+labeled events never race on git push
+# Serialize capture issue runs so simultaneous opened+labeled events never race on git push
 concurrency:
   group: process-capture-main
   cancel-in-progress: false
 
 jobs:
-  process-capture:
+  triage-and-validate:
+    name: Read-Only Safety Scan & Policy Gate
     if: >-
       github.event.issue.state == 'open' &&
       (
@@ -23,12 +25,26 @@ jobs:
           startsWith(github.event.issue.title, '[Capture]') ||
           startsWith(github.event.issue.title, '[Offset Fix + Capture]')
         )) ||
-        (github.event.action == 'labeled' && github.event.label.name == 'capture')
+        (github.event.action == 'labeled' && (
+          github.event.label.name == 'capture' ||
+          github.event.label.name == 'approved-capture'
+        ))
       )
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      is_open: ${{ steps.meta.outputs.is_open }}
+      should_ingest: ${{ steps.validate.outputs.should_ingest }}
+      validation_ok: ${{ steps.validate.outputs.validation_ok }}
+      authorized: ${{ steps.validate.outputs.authorized }}
+      actor_is_collaborator: ${{ steps.meta.outputs.actor_is_collaborator }}
+      issue_labels: ${{ steps.meta.outputs.issue_labels }}
+      model_name: ${{ steps.validate.outputs.model_name }}
     steps:
-      - name: Check if issue is still open
-        id: check_open
+      - name: Inspect live issue state & actor permissions
+        id: meta
         uses: actions/github-script@v7
         with:
           script: |
@@ -37,76 +53,183 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            core.setOutput('is_open', issue.state === 'open' ? 'true' : 'false');
-            if (issue.state !== 'open') {
-              core.notice(`Issue #${context.issue.number} is already closed (handled by an earlier run). Skipping cleanly.`);
+            const isOpen = issue.state === 'open';
+            core.setOutput('is_open', isOpen ? 'true' : 'false');
+            if (!isOpen) {
+              core.notice(`Issue #${context.issue.number} is already closed. Skipping cleanly.`);
+              return;
+            }
+            const labels = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)).filter(Boolean);
+            core.setOutput('issue_labels', labels.join(','));
+
+            let actorIsCollab = false;
+            const actor = context.actor || '';
+            if (actor) {
+              try {
+                const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: actor,
+                });
+                actorIsCollab = ['admin', 'maintain', 'write'].includes(String(perm.permission || '').toLowerCase());
+              } catch (err) {
+                core.info(`Collaborator check for ${actor}: ${err.message}`);
+              }
+            }
+            core.setOutput('actor_is_collaborator', actorIsCollab ? 'true' : 'false');
+
+      - name: Check out repo (read-only)
+        if: steps.meta.outputs.is_open == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.meta.outputs.is_open == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Read-Only Security & Schema Scan (Zero Git Writes)
+        if: steps.meta.outputs.is_open == 'true'
+        id: validate
+        run: python3 scripts/ingest_capture_issue.py --validate-only
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_AUTHOR_ASSOCIATION: ${{ github.event.issue.author_association }}
+          ISSUE_LABELS: ${{ steps.meta.outputs.issue_labels }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL_NAME: ${{ github.event.label.name }}
+          EVENT_ACTOR: ${{ github.actor }}
+          ACTOR_IS_COLLABORATOR: ${{ steps.meta.outputs.actor_is_collaborator }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag needs-review & Post Read-Only Scan Summary (Non-Allowlisted or Failed Validation)
+        if: steps.meta.outputs.is_open == 'true' && steps.validate.outputs.should_ingest != 'true'
+        uses: actions/github-script@v7
+        env:
+          SUMMARY_MD: ${{ steps.validate.outputs.summary_md }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            // Ensure `needs-review` label exists
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: 'needs-review' });
+            } catch {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: 'needs-review',
+                  color: 'd93f0b',
+                  description: 'External or flagged capture awaiting maintainer review (add approved-capture to ingest)',
+                });
+              } catch {}
             }
 
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number,
+              labels: ['needs-review'],
+            });
+
+            const body = process.env.SUMMARY_MD || '### 🛡️ SPECTRA Safety Scan\n\nManual maintainer review required before ingestion.';
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+
+  ingest-approved:
+    name: Ingest Authorized & Validated Capture
+    needs: triage-and-validate
+    if: >-
+      needs.triage-and-validate.outputs.is_open == 'true' &&
+      needs.triage-and-validate.outputs.should_ingest == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
       - name: Check out repo
-        if: steps.check_open.outputs.is_open == 'true'
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Set up Python
-        if: steps.check_open.outputs.is_open == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Extract and Ingest Capture Payload
-        if: steps.check_open.outputs.is_open == 'true'
+      - name: Re-validate and Ingest Capture Payload
         id: ingest
         run: python3 scripts/ingest_capture_issue.py
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_AUTHOR_ASSOCIATION: ${{ github.event.issue.author_association }}
+          ISSUE_LABELS: ${{ needs.triage-and-validate.outputs.issue_labels }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL_NAME: ${{ github.event.label.name }}
+          EVENT_ACTOR: ${{ github.actor }}
+          ACTOR_IS_COLLABORATOR: ${{ needs.triage-and-validate.outputs.actor_is_collaborator }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Re-index Captures Catalog
-        if: steps.check_open.outputs.is_open == 'true'
-        run: python3 scripts/index_captures.py
+      - name: Re-index & Audit Captures Catalog
+        run: |
+          python3 scripts/index_captures.py
+          python3 scripts/validate_payload.py --scan-repo --strict
 
-      - name: Commit & Push New Capture
-        if: steps.check_open.outputs.is_open == 'true'
+      - name: Commit & Push Verified Capture
         env:
           MODEL_NAME: ${{ steps.ingest.outputs.model_name }}
         run: |
           git config user.name "spectra-telemetry-bot[bot]"
           git config user.email "bot@spectra.local"
-          git add captures/ INDEX.json README.md
+          git add captures/ INDEX.json
           if git status --porcelain | grep -q .; then
-            git commit -m "feat(telemetry): integrate ${MODEL_NAME} capture [skip ci]"
+            SAFE_MODEL="$(printf '%s' "$MODEL_NAME" | tr -cd 'A-Za-z0-9 _().-')"
+            [ -n "$SAFE_MODEL" ] || SAFE_MODEL="Machine"
+            git commit -m "feat(telemetry): integrate ${SAFE_MODEL} capture [skip ci]"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
 
-      - name: Close Issue with Confirmation
-        if: steps.check_open.outputs.is_open == 'true'
+      - name: Post Confirmation & Close Issue
         uses: actions/github-script@v7
         env:
           MODEL_NAME: ${{ steps.ingest.outputs.model_name }}
           DEST_PATH: ${{ steps.ingest.outputs.dest_path }}
+          WORDS_COUNT: ${{ steps.ingest.outputs.words_count }}
+          AUTH_REASON: ${{ steps.ingest.outputs.auth_reason }}
         with:
           script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'needs-review' });
+            } catch {}
+
             const model = process.env.MODEL_NAME || 'Unknown';
             const file = process.env.DEST_PATH || '';
-            const comment = `### ✅ Telemetry Capture Ingested Successfully!\n\n` +
+            const words = process.env.WORDS_COUNT || '0';
+            const reason = process.env.AUTH_REASON || 'authorized';
+            const comment = `### ✅ Telemetry Capture Validated & Ingested Successfully!\n\n` +
               `Thank you for contributing to the SPECTRA community telemetry database!\n\n` +
               `- **Target Model**: \`${model}\`\n` +
               `- **Cataloged File**: \`${file}\`\n` +
+              `- **Verified Hex Words**: \`${words}\`\n` +
+              `- **Policy Gate**: ${reason}\n` +
               `- **Database Index**: Updated in [\`INDEX.json\`](https://github.com/Pr0xyA-91/spectra-captures/blob/main/INDEX.json)\n\n` +
-              `Engineering will review this capture to calibrate beverage and maintenance register offsets for upcoming SPECTRA releases.`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              state: 'closed'
-            });
+              `Engineering will review this capture in \`spectra-hub\` to calibrate and sign machine offsets.`;
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body: comment });
+            await github.rest.issues.update({ owner, repo, issue_number, state: 'closed' });
