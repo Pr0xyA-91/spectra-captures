@@ -8,91 +8,90 @@ permissions:
   contents: write
   issues: write
 
+# Serialize runs writing to main so simultaneous opened+labeled events never race on git push
+concurrency:
+  group: process-capture-main
+  cancel-in-progress: false
+
 jobs:
   process-capture:
-    if: contains(github.event.issue.labels.*.name, 'capture') || startsWith(github.event.issue.title, '[Capture]')
+    if: >-
+      github.event.issue.state == 'open' &&
+      (
+        (github.event.action == 'opened' && (
+          contains(github.event.issue.labels.*.name, 'capture') ||
+          startsWith(github.event.issue.title, '[Capture]') ||
+          startsWith(github.event.issue.title, '[Offset Fix + Capture]')
+        )) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'capture')
+      )
     runs-on: ubuntu-latest
     steps:
+      - name: Check if issue is still open
+        id: check_open
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            core.setOutput('is_open', issue.state === 'open' ? 'true' : 'false');
+            if (issue.state !== 'open') {
+              core.notice(`Issue #${context.issue.number} is already closed (handled by an earlier run). Skipping cleanly.`);
+            }
+
       - name: Check out repo
+        if: steps.check_open.outputs.is_open == 'true'
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
+        if: steps.check_open.outputs.is_open == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Extract and Ingest Capture Payload
+        if: steps.check_open.outputs.is_open == 'true'
         id: ingest
-        run: |
-          python3 -c "
-          import os, re, json, sys
-
-          issue_body = os.environ.get('ISSUE_BODY', '')
-          issue_num = os.environ.get('ISSUE_NUMBER', '')
-
-          # Find json block inside markdown fences
-          match = re.search(r'\`\`\`(?:json)?\s*(\{.*?\})\s*\`\`\`', issue_body, re.DOTALL)
-          if not match:
-              print('[-] Error: No JSON code block found in issue body.')
-              sys.exit(1)
-
-          raw_json = match.group(1).strip()
-          try:
-              data = json.loads(raw_json)
-          except Exception as e:
-              print(f'[-] Invalid JSON payload: {e}')
-              sys.exit(1)
-
-          ident = data.get('identity', {})
-          mfg = ident.get('manufacturer', 'Jura').strip() or 'Jura'
-          model = ident.get('model_name', 'Unknown').strip() or 'Unknown'
-          article = str(ident.get('article_number', '')).strip() or 'unknown'
-          clean_model = re.sub(r'[^A-Za-z0-9_]', '_', model).strip('_')
-
-          ts = data.get('metadata', {}).get('timestamp', '')
-          clean_ts = re.sub(r'[^0-9]', '', ts)[:14] or 'unknown'
-
-          out_dir = os.path.join('captures', mfg, clean_model)
-          os.makedirs(out_dir, exist_ok=True)
-
-          filename = f'spectra_capture_{article}_{clean_ts}.json'
-          dest_path = os.path.join(out_dir, filename)
-
-          with open(dest_path, 'w', encoding='utf-8') as f:
-              json.dump(data, f, indent=2)
-
-          print(f'[+] Successfully ingested capture to: {dest_path}')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
-              gh_out.write(f'dest_path={dest_path}\n')
-              gh_out.write(f'model_name={model}\n')
-              gh_out.write(f'article={article}\n')
-          "
+        run: python3 scripts/ingest_capture_issue.py
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Re-index Captures Catalog
-        run: |
-          python3 scripts/index_captures.py
+        if: steps.check_open.outputs.is_open == 'true'
+        run: python3 scripts/index_captures.py
 
       - name: Commit & Push New Capture
+        if: steps.check_open.outputs.is_open == 'true'
+        env:
+          MODEL_NAME: ${{ steps.ingest.outputs.model_name }}
         run: |
           git config user.name "spectra-telemetry-bot[bot]"
           git config user.email "bot@spectra.local"
           git add captures/ INDEX.json README.md
           if git status --porcelain | grep -q .; then
-            git commit -m "feat(telemetry): integrate ${{ steps.ingest.outputs.model_name }} capture [skip ci]"
-            git push
+            git commit -m "feat(telemetry): integrate ${MODEL_NAME} capture [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
           fi
 
       - name: Close Issue with Confirmation
+        if: steps.check_open.outputs.is_open == 'true'
         uses: actions/github-script@v7
+        env:
+          MODEL_NAME: ${{ steps.ingest.outputs.model_name }}
+          DEST_PATH: ${{ steps.ingest.outputs.dest_path }}
         with:
           script: |
-            const model = "${{ steps.ingest.outputs.model_name }}";
-            const file = "${{ steps.ingest.outputs.dest_path }}";
+            const model = process.env.MODEL_NAME || 'Unknown';
+            const file = process.env.DEST_PATH || '';
             const comment = `### ✅ Telemetry Capture Ingested Successfully!\n\n` +
               `Thank you for contributing to the SPECTRA community telemetry database!\n\n` +
               `- **Target Model**: \`${model}\`\n` +
