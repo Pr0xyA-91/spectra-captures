@@ -1,6 +1,6 @@
 {
   "catalog_version": "1.0",
-  "total_captures": 1,
+  "total_captures": 2,
   "captures": [
     {
       "file": "captures/Jura/ENA_7/spectra_capture_13500_20261111_101852.json",
@@ -13,6 +13,20 @@
       "ic_code": "DF01",
       "words_count": 512,
       "timestamp": "2026-11-11T10:18:52.976230",
+      "probe_version": "1.1.0",
+      "has_ground_truth": true
+    },
+    {
+      "file": "captures/Jura/ENA_8__EA/spectra_capture_15339_20261124124936.json",
+      "model_name": "ENA 8 (EA)",
+      "article_number": "15339",
+      "serial_number": "20210113041515",
+      "production_date": "13.1.2021",
+      "firmware": "EF1012M V01.02",
+      "bootloader": "BL_RL78 V01.30",
+      "ic_code": "17A9",
+      "words_count": 512,
+      "timestamp": "2026-11-24T12:49:36.399065",
       "probe_version": "1.1.0",
       "has_ground_truth": true
     }
