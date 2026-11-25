@@ -12,13 +12,16 @@ validation runs and writes ZERO bytes to disk/git.
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -28,6 +31,35 @@ import validate_payload as vp
 
 MAX_PAYLOAD_BYTES = vp.MAX_PAYLOAD_BYTES
 
+_ALLOWED_GIST_HOSTS = frozenset({
+    "api.github.com",
+    "gist.githubusercontent.com",
+    "objects.githubusercontent.com",
+})
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Enforce HTTPS and strict GitHub host allowlist on every redirect hop."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved = urllib.parse.urljoin(req.full_url, str(newurl))
+        parsed = urllib.parse.urlparse(resolved)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() != "https" or host not in _ALLOWED_GIST_HOSTS:
+            raise ValueError(
+                f"Blocked untrusted redirect target: {parsed.scheme}://{parsed.hostname}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, resolved)
+
+
+_HTTP_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
+def compute_payload_sha256(obj: Dict[str, Any]) -> str:
+    """Compute a deterministic canonical SHA-256 digest of the extracted capture object."""
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 def _read_bounded_response(resp, limit: int = MAX_PAYLOAD_BYTES) -> bytes:
     raw = resp.read(limit + 1)
@@ -36,13 +68,32 @@ def _read_bounded_response(resp, limit: int = MAX_PAYLOAD_BYTES) -> bytes:
     return raw
 
 
-def _fetch_gist_capture(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]:
+def _parse_gist_reference(issue_body: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Extract (gist_id, optional_commit_sha) from a gist.github.com URL without backtracking."""
+    for m in re.finditer(r"https://gist\.github\.com/([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){0,3})", issue_body):
+        parts = [p for p in m.group(1).split("/") if p]
+        if len(parts) == 1:
+            if re.fullmatch(r"[0-9a-fA-F]{16,40}", parts[0]):
+                return parts[0], None
+        elif len(parts) == 2:
+            if re.fullmatch(r"[0-9a-fA-F]{16,40}", parts[0]) and re.fullmatch(r"[0-9a-fA-F]{40}", parts[1]):
+                return parts[0], parts[1]
+            if re.fullmatch(r"[0-9a-fA-F]{16,40}", parts[1]):
+                return parts[1], None
+        elif len(parts) >= 3:
+            if re.fullmatch(r"[0-9a-fA-F]{16,40}", parts[1]):
+                sha = parts[2] if re.fullmatch(r"[0-9a-fA-F]{7,40}", parts[2]) else None
+                return parts[1], sha
+    return None
+
+
+def _fetch_gist_capture_with_meta(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
     """If the capture exceeded 65KB and was uploaded to a GitHub Gist, fetch its JSON safely (<= 250 KB)."""
-    m = re.search(r"https://gist\.github\.com/(?:[A-Za-z0-9_.-]+/)?([0-9a-fA-F]{16,40})", issue_body)
-    if not m:
-        return None, 0
-    gist_id = m.group(1)
-    api_url = f"https://api.github.com/gists/{gist_id}"
+    ref = _parse_gist_reference(issue_body)
+    if not ref:
+        return None, 0, None
+    gist_id, gist_sha = ref
+    api_url = f"https://api.github.com/gists/{gist_id}/{gist_sha}" if gist_sha else f"https://api.github.com/gists/{gist_id}"
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "SPECTRA-Captures-Bot",
@@ -51,9 +102,18 @@ def _fetch_gist_capture(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with _HTTP_OPENER.open(req, timeout=20) as resp:
         gist_raw = _read_bounded_response(resp, limit=MAX_PAYLOAD_BYTES * 2)
     gist_data = json.loads(gist_raw.decode("utf-8"))
+
+    gist_version = gist_sha
+    if not gist_version:
+        history = gist_data.get("history")
+        if isinstance(history, list) and history and isinstance(history[0], dict):
+            ver = str(history[0].get("version") or "").strip()
+            if ver:
+                gist_version = ver
+
     files = gist_data.get("files") or {}
     for _fname, meta in files.items():
         if not isinstance(meta, dict):
@@ -64,10 +124,11 @@ def _fetch_gist_capture(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]
         content = meta.get("content")
         if meta.get("truncated") and meta.get("raw_url"):
             parsed_url = urllib.parse.urlparse(str(meta["raw_url"]))
-            if parsed_url.scheme != "https" or parsed_url.hostname != "gist.githubusercontent.com":
+            host = (parsed_url.hostname or "").lower()
+            if parsed_url.scheme.lower() != "https" or host not in _ALLOWED_GIST_HOSTS:
                 raise ValueError(f"Rejected non-GitHub Gist raw URL host: {parsed_url.hostname!r}")
             raw_req = urllib.request.Request(meta["raw_url"], headers={"User-Agent": "SPECTRA-Captures-Bot"})
-            with urllib.request.urlopen(raw_req, timeout=20) as raw_resp:
+            with _HTTP_OPENER.open(raw_req, timeout=20) as raw_resp:
                 raw_bytes = _read_bounded_response(raw_resp, limit=MAX_PAYLOAD_BYTES)
             content = raw_bytes.decode("utf-8")
         if isinstance(content, str) and content:
@@ -77,10 +138,35 @@ def _fetch_gist_capture(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]
             try:
                 obj = json.loads(content)
                 if isinstance(obj, dict) and ("eeprom_words" in obj or "identity" in obj):
-                    return obj, raw_len
+                    return obj, raw_len, gist_version
             except Exception:
                 continue
-    return None, 0
+    return None, 0, gist_version
+
+
+def _fetch_gist_capture(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]:
+    obj, raw_len, _gist_version = _fetch_gist_capture_with_meta(issue_body)
+    return obj, raw_len
+
+
+def _iter_fenced_json_blocks(text: str) -> Iterator[str]:
+    """Linear O(N) markdown code-fence scanner using str.find('```') with zero regex backtracking."""
+    pos = 0
+    n = len(text)
+    while pos < n:
+        start = text.find("```", pos)
+        if start == -1:
+            break
+        end = text.find("```", start + 3)
+        if end == -1:
+            break
+        block = text[start + 3 : end]
+        pos = end + 3
+        if block[:4].lower() == "json":
+            block = block[4:]
+        stripped = block.strip()
+        if len(stripped) >= 2 and stripped.startswith("{") and stripped.endswith("}"):
+            yield stripped
 
 
 def extract_capture_payload(issue_body: str) -> Tuple[Optional[Dict[str, Any]], int]:
@@ -91,9 +177,9 @@ def extract_capture_payload(issue_body: str) -> Tuple[Optional[Dict[str, Any]], 
 
     candidates = []
     patch_meta: Dict[str, Any] = {}
+    gist_version: Optional[str] = None
 
-    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", issue_body, re.DOTALL):
-        raw_json = m.group(1).strip()
+    for raw_json in _iter_fenced_json_blocks(issue_body):
         raw_len = len(raw_json.encode("utf-8"))
         if raw_len > MAX_PAYLOAD_BYTES:
             raise ValueError(f"Embedded JSON block exceeds 250 KB limit ({raw_len:,} bytes).")
@@ -112,7 +198,7 @@ def extract_capture_payload(issue_body: str) -> Tuple[Optional[Dict[str, Any]], 
     if candidates:
         data, raw_size = candidates[-1]
     else:
-        data, raw_size = _fetch_gist_capture(issue_body)
+        data, raw_size, gist_version = _fetch_gist_capture_with_meta(issue_body)
 
     if not isinstance(data, dict):
         return None, body_bytes
@@ -132,6 +218,9 @@ def extract_capture_payload(issue_body: str) -> Tuple[Optional[Dict[str, Any]], 
         meta = data["metadata"]
         if not meta.get("timestamp") and patch_meta.get("timestamp"):
             meta["timestamp"] = str(patch_meta["timestamp"]).strip()
+
+    if gist_version and not data["metadata"].get("gist_revision"):
+        data["metadata"]["gist_revision"] = gist_version
 
     if not isinstance(data.get("identity"), dict):
         data["identity"] = dict(patch_meta.get("identity") or {})
@@ -181,6 +270,7 @@ def main(argv=None) -> int:
     label_added = os.environ.get("EVENT_LABEL_NAME", "")
     actor_login = os.environ.get("EVENT_ACTOR", "")
     actor_is_collab = os.environ.get("ACTOR_IS_COLLABORATOR", "false").lower() == "true"
+    expected_scan_sha256 = os.environ.get("EXPECTED_SCAN_SHA256", "").strip()
 
     labels_ok, disallowed_labels = vp.validate_issue_labels(issue_labels)
     authorized, auth_reason = vp.is_auto_ingest_authorized(
@@ -222,6 +312,23 @@ def main(argv=None) -> int:
         else:
             val_res = vp.validate_capture_dict(data, raw_size_bytes=raw_size, strict_keys=True)
 
+    payload_sha256 = compute_payload_sha256(data) if isinstance(data, dict) else ""
+
+    # Enforce TOCTOU integrity check when approving an external capture via `approved-capture`
+    if expected_scan_sha256:
+        if expected_scan_sha256 == "MISSING_PRIOR_SCAN":
+            val_res["ok"] = False
+            val_res.setdefault("errors", []).append(
+                "TOCTOU security check failed: no prior automated safety scan hash was found on this issue. "
+                "The issue body or linked Gist could not be verified against an earlier safety scan before `approved-capture` was applied."
+            )
+        elif not payload_sha256 or not hmac.compare_digest(payload_sha256, expected_scan_sha256.lower()):
+            val_res["ok"] = False
+            val_res.setdefault("errors", []).append(
+                "TOCTOU security check failed: the issue body or linked Gist payload changed after the automated safety scan "
+                f"(expected SHA-256 `{expected_scan_sha256.lower()}`, observed `{payload_sha256 or 'unavailable'}`)."
+            )
+
     overall_ok = bool(val_res["ok"]) and labels_ok
     summary_md = vp.format_scan_summary_markdown(
         val_res,
@@ -229,6 +336,8 @@ def main(argv=None) -> int:
         auth_reason=auth_reason,
         disallowed_labels=disallowed_labels if not labels_ok else None,
     )
+    if args.validate_only and overall_ok and payload_sha256:
+        summary_md = f"{summary_md}\n\n<!-- [SPECTRA-SCAN-SHA256:{payload_sha256}] -->"
 
     _write_gh_output("validation_ok", "true" if overall_ok else "false")
     _write_gh_output("authorized", "true" if authorized else "false")
@@ -238,6 +347,7 @@ def main(argv=None) -> int:
     _write_gh_output("article", val_res.get("article_number") or "unknown")
     _write_gh_output("words_count", str(val_res.get("words_count", 0)))
     _write_gh_output("payload_bytes", str(val_res.get("payload_bytes", 0)))
+    _write_gh_output("payload_sha256", payload_sha256)
     _write_gh_output("summary_md", summary_md)
 
     print(summary_md)
@@ -282,6 +392,30 @@ def main(argv=None) -> int:
     if os.path.commonpath([captures_root, abs_dest]) != captures_root:
         print("[-] Refusing path traversal target.", file=sys.stderr)
         return 1
+
+    if os.path.exists(abs_dest):
+        existing_sha = ""
+        try:
+            with open(abs_dest, "rb") as existing_fh:
+                existing_raw = existing_fh.read()
+            try:
+                existing_obj = json.loads(existing_raw.decode("utf-8"))
+                if isinstance(existing_obj, dict):
+                    existing_sha = compute_payload_sha256(existing_obj)
+                else:
+                    existing_sha = hashlib.sha256(existing_raw).hexdigest()
+            except Exception:
+                existing_sha = hashlib.sha256(existing_raw).hexdigest()
+        except OSError:
+            existing_sha = ""
+
+        if existing_sha != payload_sha256:
+            filename = f"spectra_capture_{article}_{clean_ts}_{payload_sha256[:8]}.json"
+            rel_dest = os.path.join(rel_dir, filename)
+            abs_dest = os.path.realpath(os.path.join(out_dir, filename))
+            if os.path.commonpath([captures_root, abs_dest]) != captures_root:
+                print("[-] Refusing path traversal target.", file=sys.stderr)
+                return 1
 
     serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     if len(serialized.encode("utf-8")) > MAX_PAYLOAD_BYTES:

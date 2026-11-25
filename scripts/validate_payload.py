@@ -89,11 +89,9 @@ _SECRET_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
 )
 
 _POISON_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
-    ("xss_script_tag", re.compile(r"(?i)<\s*/?\s*(?:script|iframe|object|embed|svg|math|style|link|meta)\b")),
+    ("xss_script_tag", re.compile(r"(?i)<\s*(?:/\s*)?(?:script|iframe|object|embed|svg|math|style|link|meta)\b")),
     ("xss_event_handler", re.compile(r"(?i)\bon(?:error|load|click|mouseover|focus|submit|animationstart)\s*=")),
     ("xss_uri_scheme", re.compile(r"(?i)\b(?:javascript|vbscript|data\s*:\s*text/html)\s*:")),
-    ("gha_expr_injection", re.compile(r"\$\{\{.*?\}\}")),
-    ("shell_cmd_subst", re.compile(r"\$\([^)]+\)|`[^`]+`")),
     ("python_exec_poison", re.compile(r"\b(?:__import__|eval|exec|subprocess|os\.system|os\.popen|shutil\.rmtree)\s*\(")),
 )
 
@@ -182,6 +180,10 @@ def _check_string_safety(text: str, path: str, errors: List[str], allow_newlines
     for pname, pat in _SECRET_PATTERNS:
         if pat.search(text):
             errors.append(f"Potential secret/PII leak ({pname}) detected at {path}")
+    if "${{" in text:
+        errors.append(f"Potential payload poisoning (gha_expr_injection) detected at {path}")
+    if "$(" in text or "`" in text:
+        errors.append(f"Potential payload poisoning (shell_cmd_subst) detected at {path}")
     for pname, pat in _POISON_PATTERNS:
         if pat.search(text):
             errors.append(f"Potential payload poisoning ({pname}) detected at {path}")

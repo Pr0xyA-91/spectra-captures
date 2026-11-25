@@ -3,9 +3,13 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+import urllib.request
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
@@ -141,11 +145,180 @@ class TestSpectraCapturesSecurity(unittest.TestCase):
             self.assertIn("authorized=false", out_txt)
             self.assertIn("should_ingest=false", out_txt)
             self.assertIn("needs-review", out_txt)
+            self.assertIn("payload_sha256=", out_txt)
+            self.assertIn("<!-- [SPECTRA-SCAN-SHA256:", out_txt)
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
             if os.path.exists(gh_out_path):
                 os.remove(gh_out_path)
+
+    def test_redos_unclosed_fences_200kb_linear_time(self):
+        payload = "```{" * 50000  # 200,000 bytes (< 250 KB limit)
+        t0 = time.perf_counter()
+        data, raw_size = ingest.extract_capture_payload(payload)
+        elapsed = time.perf_counter() - t0
+        self.assertIsNone(data)
+        self.assertEqual(raw_size, len(payload.encode("utf-8")))
+        self.assertLess(elapsed, 0.1, f"Fence parser took too long: {elapsed:.4f}s")
+
+    def test_redos_poison_gha_expr_linear_time_and_flagged(self):
+        poison_str = "${{" * 5000
+        errors = []
+        t0 = time.perf_counter()
+        vp._check_string_safety(poison_str, "metadata.notes", errors)
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.1, f"Poison check took too long: {elapsed:.4f}s")
+        self.assertTrue(any("gha_expr_injection" in e for e in errors), errors)
+
+        cap = _minimal_valid_capture()
+        cap["metadata"]["notes"] = poison_str[:1500]
+        res = vp.validate_capture_dict(cap)
+        self.assertFalse(res["ok"])
+        self.assertTrue(any("gha_expr_injection" in e for e in res["errors"]))
+
+    def test_toctou_expected_scan_sha256_match_and_mismatch(self):
+        cap = _minimal_valid_capture()
+        issue_body = f"```json\n{json.dumps(cap)}\n```\n"
+        extracted, _ = ingest.extract_capture_payload(issue_body)
+        expected_sha = ingest.compute_payload_sha256(extracted)
+
+        with tempfile.TemporaryDirectory() as tmp_repo:
+            os.makedirs(os.path.join(tmp_repo, "scripts"), exist_ok=True)
+            os.makedirs(os.path.join(tmp_repo, "captures"), exist_ok=True)
+            fake_script_path = os.path.join(tmp_repo, "scripts", "ingest_capture_issue.py")
+            gh_out_path = os.path.join(tmp_repo, "gh_out.txt")
+
+            env_backup = dict(os.environ)
+            try:
+                # 1) Matching EXPECTED_SCAN_SHA256 succeeds
+                os.environ.update({
+                    "ISSUE_BODY": issue_body,
+                    "ISSUE_AUTHOR": "external-contributor",
+                    "ISSUE_AUTHOR_ASSOCIATION": "NONE",
+                    "ISSUE_LABELS": "capture,approved-capture",
+                    "EVENT_ACTION": "labeled",
+                    "EVENT_LABEL_NAME": "approved-capture",
+                    "EVENT_ACTOR": "Pr0xyA-91",
+                    "ACTOR_IS_COLLABORATOR": "true",
+                    "EXPECTED_SCAN_SHA256": expected_sha,
+                    "GITHUB_OUTPUT": gh_out_path,
+                })
+                with mock.patch.object(ingest, "__file__", fake_script_path):
+                    rc = ingest.main(["--validate-only"])
+                self.assertEqual(rc, 0)
+                with open(gh_out_path, "r", encoding="utf-8") as fh:
+                    out_txt = fh.read()
+                self.assertIn("validation_ok=true", out_txt)
+                self.assertIn("should_ingest=true", out_txt)
+
+                # 2) Tampered body (mismatching EXPECTED_SCAN_SHA256) blocks ingestion
+                tampered_cap = _minimal_valid_capture()
+                tampered_cap["eeprom_words"]["0x0001"] = 999
+                tampered_body = f"```json\n{json.dumps(tampered_cap)}\n```\n"
+                with open(gh_out_path, "w", encoding="utf-8") as fh:
+                    fh.truncate(0)
+                os.environ["ISSUE_BODY"] = tampered_body
+                with mock.patch.object(ingest, "__file__", fake_script_path):
+                    rc_validate = ingest.main(["--validate-only"])
+                    rc_ingest = ingest.main([])
+                self.assertEqual(rc_validate, 0)
+                self.assertEqual(rc_ingest, 1)
+                with open(gh_out_path, "r", encoding="utf-8") as fh:
+                    tamper_out = fh.read()
+                self.assertIn("validation_ok=false", tamper_out)
+                self.assertIn("should_ingest=false", tamper_out)
+                self.assertIn("TOCTOU security check failed", tamper_out)
+
+                # 3) MISSING_PRIOR_SCAN blocks ingestion
+                with open(gh_out_path, "w", encoding="utf-8") as fh:
+                    fh.truncate(0)
+                os.environ["ISSUE_BODY"] = issue_body
+                os.environ["EXPECTED_SCAN_SHA256"] = "MISSING_PRIOR_SCAN"
+                with mock.patch.object(ingest, "__file__", fake_script_path):
+                    rc_missing = ingest.main([])
+                self.assertEqual(rc_missing, 1)
+                with open(gh_out_path, "r", encoding="utf-8") as fh:
+                    missing_out = fh.read()
+                self.assertIn("should_ingest=false", missing_out)
+                self.assertIn("no prior automated safety scan hash", missing_out)
+            finally:
+                os.environ.clear()
+                os.environ.update(env_backup)
+
+    def test_safe_redirect_handler_blocks_downgrade_and_untrusted_hosts(self):
+        handler = ingest._SafeRedirectHandler()
+        orig_req = urllib.request.Request("https://api.github.com/gists/0123456789abcdef")
+
+        # HTTP downgrade blocked
+        with self.assertRaises(ValueError):
+            handler.redirect_request(
+                orig_req, None, 302, "Found", {}, "http://gist.githubusercontent.com/user/0123456789abcdef/raw"
+            )
+
+        # Untrusted HTTPS host blocked
+        with self.assertRaises(ValueError):
+            handler.redirect_request(
+                orig_req, None, 302, "Found", {}, "https://evil.example/payload.json"
+            )
+
+        # Trusted HTTPS host allowed
+        allowed = handler.redirect_request(
+            orig_req, None, 302, "Found", {}, "https://objects.githubusercontent.com/some/path"
+        )
+        self.assertIsNotNone(allowed)
+        self.assertEqual(allowed.full_url, "https://objects.githubusercontent.com/some/path")
+
+    def test_duplicate_article_timestamp_disambiguates_filename(self):
+        cap1 = _minimal_valid_capture()
+        cap2 = _minimal_valid_capture()
+        cap2["eeprom_words"]["0x0001"] = 204  # different content, same article & timestamp
+
+        body1 = f"```json\n{json.dumps(cap1)}\n```\n"
+        body2 = f"```json\n{json.dumps(cap2)}\n```\n"
+
+        sha2 = ingest.compute_payload_sha256(cap2)
+
+        with tempfile.TemporaryDirectory() as tmp_repo:
+            os.makedirs(os.path.join(tmp_repo, "scripts"), exist_ok=True)
+            os.makedirs(os.path.join(tmp_repo, "captures"), exist_ok=True)
+            fake_script_path = os.path.join(tmp_repo, "scripts", "ingest_capture_issue.py")
+            gh_out_path = os.path.join(tmp_repo, "gh_out.txt")
+
+            env_backup = dict(os.environ)
+            try:
+                os.environ.update({
+                    "ISSUE_BODY": body1,
+                    "ISSUE_AUTHOR": "Pr0xyA-91",
+                    "ISSUE_AUTHOR_ASSOCIATION": "OWNER",
+                    "ISSUE_LABELS": "capture",
+                    "EVENT_ACTION": "opened",
+                    "EVENT_ACTOR": "Pr0xyA-91",
+                    "ACTOR_IS_COLLABORATOR": "true",
+                    "EXPECTED_SCAN_SHA256": "",
+                    "GITHUB_OUTPUT": gh_out_path,
+                })
+                with mock.patch.object(ingest, "__file__", fake_script_path):
+                    rc1 = ingest.main([])
+                    self.assertEqual(rc1, 0)
+
+                    os.environ["ISSUE_BODY"] = body2
+                    rc2 = ingest.main([])
+                    self.assertEqual(rc2, 0)
+
+                target_dir = os.path.join(tmp_repo, "captures", "Jura", "ENA_8__EA")
+                files = sorted(os.listdir(target_dir))
+                expected_first = "spectra_capture_15339_20261124100000.json"
+                expected_second = f"spectra_capture_15339_20261124100000_{sha2[:8]}.json"
+                self.assertEqual(files, sorted([expected_first, expected_second]))
+
+                with open(os.path.join(target_dir, expected_first), "r", encoding="utf-8") as f1:
+                    self.assertEqual(json.load(f1)["eeprom_words"]["0x0001"], 103)
+                with open(os.path.join(target_dir, expected_second), "r", encoding="utf-8") as f2:
+                    self.assertEqual(json.load(f2)["eeprom_words"]["0x0001"], 204)
+            finally:
+                os.environ.clear()
+                os.environ.update(env_backup)
 
 
 if __name__ == "__main__":

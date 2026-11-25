@@ -41,11 +41,12 @@ jobs:
       authorized: ${{ steps.validate.outputs.authorized }}
       actor_is_collaborator: ${{ steps.meta.outputs.actor_is_collaborator }}
       issue_labels: ${{ steps.meta.outputs.issue_labels }}
+      expected_scan_sha256: ${{ steps.meta.outputs.expected_scan_sha256 }}
       model_name: ${{ steps.validate.outputs.model_name }}
     steps:
       - name: Inspect live issue state & actor permissions
         id: meta
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const { data: issue } = await github.rest.issues.get({
@@ -78,15 +79,44 @@ jobs:
             }
             core.setOutput('actor_is_collaborator', actorIsCollab ? 'true' : 'false');
 
+            let expectedScanSha = '';
+            const labelName = String(context.payload.label?.name || '').toLowerCase();
+            if (context.payload.action === 'labeled' && labelName === 'approved-capture') {
+              const authorLogin = String(issue.user?.login || '').toLowerCase();
+              const authorAssoc = String(issue.author_association || '').toUpperCase();
+              const isTrustedAuthor = ['pr0xya-91', 'neon-rat'].includes(authorLogin) || ['OWNER', 'COLLABORATOR'].includes(authorAssoc);
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+              for (let i = comments.length - 1; i >= 0; i--) {
+                const c = comments[i];
+                const login = String(c.user?.login || '').toLowerCase();
+                if (login !== 'github-actions[bot]') continue;
+                const match = String(c.body || '').match(/\[SPECTRA-SCAN-SHA256:([0-9a-f]{64})\]/);
+                if (match) {
+                  expectedScanSha = match[1];
+                  break;
+                }
+              }
+              if (!expectedScanSha && !isTrustedAuthor) {
+                expectedScanSha = 'MISSING_PRIOR_SCAN';
+              }
+            }
+            core.setOutput('expected_scan_sha256', expectedScanSha);
+
       - name: Check out repo (read-only)
         if: steps.meta.outputs.is_open == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
       - name: Set up Python
         if: steps.meta.outputs.is_open == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -104,11 +134,12 @@ jobs:
           EVENT_LABEL_NAME: ${{ github.event.label.name }}
           EVENT_ACTOR: ${{ github.actor }}
           ACTOR_IS_COLLABORATOR: ${{ steps.meta.outputs.actor_is_collaborator }}
+          EXPECTED_SCAN_SHA256: ${{ steps.meta.outputs.expected_scan_sha256 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Tag needs-review & Post Read-Only Scan Summary (Non-Allowlisted or Failed Validation)
         if: steps.meta.outputs.is_open == 'true' && steps.validate.outputs.should_ingest != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           SUMMARY_MD: ${{ steps.validate.outputs.summary_md }}
         with:
@@ -128,6 +159,12 @@ jobs:
                   color: 'd93f0b',
                   description: 'External or flagged capture awaiting maintainer review (add approved-capture to ingest)',
                 });
+              } catch {}
+            }
+
+            if (context.payload.action === 'labeled' && String(context.payload.label?.name || '').toLowerCase() === 'approved-capture') {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'approved-capture' });
               } catch {}
             }
 
@@ -158,13 +195,13 @@ jobs:
       issues: write
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -181,6 +218,7 @@ jobs:
           EVENT_LABEL_NAME: ${{ github.event.label.name }}
           EVENT_ACTOR: ${{ github.actor }}
           ACTOR_IS_COLLABORATOR: ${{ needs.triage-and-validate.outputs.actor_is_collaborator }}
+          EXPECTED_SCAN_SHA256: ${{ needs.triage-and-validate.outputs.expected_scan_sha256 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Re-index & Audit Captures Catalog
@@ -204,7 +242,7 @@ jobs:
           fi
 
       - name: Post Confirmation & Close Issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           MODEL_NAME: ${{ steps.ingest.outputs.model_name }}
           DEST_PATH: ${{ steps.ingest.outputs.dest_path }}
