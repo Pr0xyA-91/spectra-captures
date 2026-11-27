@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "model_name": "Jura Z6",
+    "article_number": "15012"
+  },
+  "eeprom_words": {
+    "0x0001": 100
+  },
+  "metadata": {
+    "timestamp": "2026-11-27 18:12:49",
+    "spectra_build": "20261125.1535",
+    "probe_version": "Build 20261125.1535"
+  },
+  "gateways": {}
+}
